@@ -75,11 +75,15 @@ def review_gate(book: Path, ch: str) -> list[str]:
     missing = [n for n in range(1, k + 1) if n not in items]
     if missing:
         issues.append(f"验收 {missing} 未被审校注记回答（共 {k} 条，须逐条 N. ✓/✗+证据）")
+    # 证据判定（novel_craft.md#打磨与校对）：每条结论必须带证据——正文引文，或 evidence 字段名+数值。
+    # 不再用"整行 ≥24 字符"的任意长阈值（会误伤语句精炼但已给引文/数值的证据）。
+    EVIDENCE_QUOTE_RE = re.compile(r"[「“\"'『]")          # 引号 = 正文引文
+    EVIDENCE_FIELD_RE = re.compile(r"[A-Za-z_][\w]*[:：]\s*[\d.]+|[A-Za-z_]+\s*=\s*[\d.]+")  # 字段:值
     for n, line in sorted(items.items()):
         if not re.search(r"[✓✗×√]", line):
             issues.append(f"验收 {n} 无 ✓/✗ 判定符")
-        elif len(line) < 24:
-            issues.append(f"验收 {n} 打了判定符但证据线过短（无证据的判定 = 未审）")
+        elif not (EVIDENCE_QUOTE_RE.search(line) or EVIDENCE_FIELD_RE.search(line)):
+            issues.append(f"验收 {n} 打了判定符但无证据（须含正文引文或 evidence 字段名+数值）")
     return issues
 
 
@@ -207,13 +211,29 @@ def run_checks(book: Path) -> dict:
             prev_form_by_vol[vol] = (num, form)
 
     # ---- 流程事实（warn 级）：final 无 raw / 无 beats ----
-    raw_nums = {common.chapter_number_from_name(f.name) for f in common.find_chapter_files(book, "raw")}
-    beats_nums = {common.chapter_number_from_name(f.name) for f in common.find_chapter_files(book, "beats")}
-    for n in sorted(per_ch):
+    # 与 final 的 per_ch 同口径，按 (卷, 章号) 键控：跨卷同章号互不覆盖，
+    # 避免 vol_02/ch_001 的缺口被 vol_01/ch_001 的原料"顶掉"而漏报。
+    def _vol_nums(area: str) -> set[tuple[str, int]]:
+        out = set()
+        for f in common.find_chapter_files(book, area):
+            n = common.chapter_number_from_name(f.name)
+            if n is None:
+                continue
+            base = book / ("outlines" if area == "beats" else "manuscript")
+            try:
+                vol = f.relative_to(base).parts[0]
+            except ValueError:
+                vol = ""
+            out.add((vol, n))
+        return out
+
+    raw_nums = _vol_nums("raw")
+    beats_nums = _vol_nums("beats")
+    for (vol, n) in sorted(per_ch):
         tok = f"ch_{n:03d}"
-        if n not in raw_nums:
+        if (vol, n) not in raw_nums:
             warnings.append(_err("final_without_raw", f"{tok}: 有定稿但无 raw 草稿（流程事实，供核对）"))
-        if n not in beats_nums:
+        if (vol, n) not in beats_nums:
             warnings.append(_err("final_without_beats", f"{tok}: 有定稿但无 beats 细纲（流程事实，供核对）"))
 
     # ---- 字数带偏离（只报数） ----

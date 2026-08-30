@@ -77,7 +77,11 @@ def _form_notice(book: Path, ch: str, ch_num: int) -> list[str]:
 
 
 def _hard_reminders(book: Path, ch_num: int) -> list[str]:
-    """纯算术事实：到期/过期线、未澄清误会、style_guards、偏离清单、form 同款提示。"""
+    """纯算术事实：到期/过期线、未澄清误会、style_guards、偏离清单、form 同款提示。
+
+    容错说明：这里对 lines 台账损坏显式降级为"空台账"（而非抛错/静默兜底为默认值），
+    属于 pack 这层"尽可能把上下文交给子代理"的有意例外——pack 的职责是装配提示，
+    台账损坏应由 check/状态体检报错，不让它阻断"还能写的章"。"""
     out: list[str] = []
     try:
         lines = state.load_state(book, "lines")
@@ -196,6 +200,24 @@ def build_pack(book: Path, ch: str, lean: bool = False, full: bool = False) -> d
     budget["total"] = sum(budget.values())
     budget["cap"] = PACK_TOKEN_CAP
     budget["over_budget"] = budget["total"] > PACK_TOKEN_CAP
+
+    # 超预算硬裁（engine/README.md 契约）：优先裁 P2 冷索引（file_index），
+    # P0 热层 / P1 温层是写作所需的活性上下文，尽最大可能保留；裁剪后重算预算并如实上报。
+    if budget["over_budget"] and payload.get("p2"):
+        fi = payload["p2"].get("file_index", [])
+        trimmed = 0
+        while budget["over_budget"] and fi:
+            fi.pop()
+            trimmed += 1
+            payload["p2"]["file_index"] = fi
+            r = render_layer("p2", payload["p2"], full=full)
+            budget["p2"] = common.est_tokens(r)
+            budget["total"] = budget["p0"] + budget.get("p1", 0) + budget["p2"]
+            budget["over_budget"] = budget["total"] > budget["cap"]
+        if trimmed:
+            budget["trimmed_file_index"] = trimmed
+            budget["trim_note"] = f"超预算按优先级硬裁 P2 冷索引 {trimmed} 条（P0/P1 保留）"
+
     payload["budget_report"] = budget
     payload["hits"] = sorted(hits)
     return payload
@@ -251,6 +273,14 @@ def open_file(book: Path, rel: str) -> dict:
 # ---------------------------------------------------------------------------
 # export：全书编译（PLAN §7.1：final 纯净正文直接可用；视图按需渲染，非常态义务）
 # ---------------------------------------------------------------------------
+def _safe_filename(name: str, fallback: str = "book") -> str:
+    """把书名净化成可安全用于文件名的字符串（剥离路径分隔符/控制字符/越界点段）。"""
+    s = re.sub(r"[\\/<>:\"|?*\x00-\x1f]", "_", (name or "").strip())
+    s = re.sub(r"\.\.+", "_", s)          # 防止 ".." 路径越界
+    s = re.sub(r"\s+", "_", s).strip("._")
+    return s or fallback
+
+
 def export_txt(book: Path) -> Path:
     proj = common.load_json(book / "project.json", default={}) or {}
     title = proj.get("title") or book.name
@@ -276,12 +306,13 @@ def export_txt(book: Path) -> Path:
     for vol in vols:
         body = [f.read_text(encoding="utf-8", errors="replace").strip() + "\n"
                 for (v, n), (_, f) in sorted(chosen.items()) if v == vol]
-                if body:
+        if body:
             parts.append(f"\n\n# {vol}\n")
             parts.extend(body)
     out = book / "export"
     out.mkdir(parents=True, exist_ok=True)
-    path = out / f"{title}.txt"
+    # 文件名用净化过的书名（safe_child_path 纪律：不把可控输入直接拼进路径）
+    path = out / f"{_safe_filename(title)}.txt"
     path.write_text("\n".join(parts), encoding="utf-8")
     return path
 

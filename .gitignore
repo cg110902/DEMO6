@@ -1,0 +1,18 @@
+# Novel Studio — 运行时/数据产物不纳入版本库
+
+# 书工作区（书稿正文、状态、快照、导出等数据层）
+/workspace/
+
+# Python 缓存与构建产物
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+
+# 本地临时/日志
+*.tmp
+.DS_Store

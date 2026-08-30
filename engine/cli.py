@@ -70,12 +70,25 @@ def _instantiate_templates(book: Path, slots: dict[str, str]) -> list[str]:
     return done
 
 
+def _init_workspace(arg: str) -> Path:
+    """init 的书目录归一化：相对路径若未指向 workspace/，自动归位到 workspace/<arg>，
+    避免用户在仓库根目录建书（如 `init -w 我的书` 误建到仓库根）。"""
+    p = Path(arg).expanduser()
+    if p.is_absolute():
+        return common.resolve_workspace(arg)
+    rel = p
+    if not rel.parts or rel.parts[0] != "workspace":
+        rel = Path("workspace") / rel
+    book = common.resolve_workspace(str(rel))
+    assert book is not None
+    return book
+
+
 def cmd_init(args) -> int:
     if not args.workspace:
         print('❌ init 需要 -w 指定书目录，如 -w workspace/我的书')
         return 2
-    book = common.resolve_workspace(args.workspace)
-    assert book is not None
+    book = _init_workspace(args.workspace)
     if book.exists() and any(book.iterdir()) and not (book / "project.json").exists():
         print(f"⛔ 目标目录非空且不是已登记的书，拒绝写入: {book}")
         return 1
@@ -102,6 +115,8 @@ def cmd_init(args) -> int:
             (book / "log" / "review").mkdir(parents=True, exist_ok=True)
             print(f"🧹 已清理草稿区与待办收件箱（保留圣经/细纲/状态；审计记录 processed/failed 保留）: "
                   f"{book}（{cleared} 处）")
+            print("   说明：state/（6 JSON + .applied_operations.json）与快照已保留，"
+                  "所以 status 里已合并/已快照的章仍会标绿；若要连同状态一起清，请用 `init --force` 整本重开。")
             return 0
         if args.force:
             import shutil
@@ -206,7 +221,10 @@ def cmd_status(args) -> int:
         if args.json:
             hint = ("存在多本书，请 -w 指定" if len(books) > 1
                     else 'python studio.py init -w workspace/<slug> -t "书名"')
-            print(json.dumps({"exists": False, "books": [str(b) for b in books], "next_action": hint},
+            # exists=False 表示"未解析到唯一选中书"，而非"没有任何书"；用 reason 显式说明歧义来源。
+            reason = "multiple_books" if len(books) > 1 else "no_books"
+            print(json.dumps({"exists": False, "reason": reason,
+                              "books": [str(b) for b in books], "next_action": hint},
                              ensure_ascii=False, indent=2))
         else:
             if len(books) > 1:
@@ -224,8 +242,10 @@ def cmd_status(args) -> int:
         return 0
     print("=" * 70)
     mark = lambda b: "✅" if b else "· "  # noqa: E731
+    latest_str = (f"ch_{brief['latest_finalized']:03d}" if brief["latest_finalized"]
+                  else "(未定稿)")
     print(f" 📖 {brief['title'] or '(未命名)'} ｜ {brief['genre'] or '?'} ｜ 模式 {brief['mode']}")
-    print(f"    已定稿 {brief['finalized_chapters']} 章（最新 ch_{brief['latest_finalized']:03d}）"
+    print(f"    已定稿 {brief['finalized_chapters']} 章（最新 {latest_str}）"
           f" ｜ 共 {brief['total_words']} 字 ｜ 待合并提案 {len(brief['pending_proposals'])}"
           f" ｜ 快照 {brief['snapshot_count']}")
     if brief["pipeline"]:
@@ -422,6 +442,12 @@ def cmd_sync(args) -> int:
         print(f"❌ 提案内容与同步目标不一致: {proposal_path.name} 的 chapter={got} ≠ {ch}，拒绝空同步")
         return 1
 
+    # 前置闸门：Stage 4 输入合同 beats/raw/final 齐（novel_workflow.md#Stage 4 同步封存）。
+    # 无 beats 细纲不得封存——防止"无细纲、零更新"的章被空提案推进（配合空提案 no-op 识别）。
+    if not common.find_chapter_files(book, "beats", ch):
+        print(f"❌ 未找到 {ch} 的 beats 细纲，拒绝封存（Stage 4 输入合同：beats/raw/final 齐）")
+        return 1
+
     gate = checks.review_gate(book, ch)
     if gate:
         for g in gate:
@@ -506,21 +532,24 @@ def cmd_proposal(args) -> int:
     skeleton = {
         "schema": "novel-studio.state-mutation/v2", "chapter": ch,
         "operation_id": f"{ch}.syncer.{mmdd}",
-        "current": {"time": "", "location": "", "present_characters": []},
+        # current 照 current.schema.json 的 9 个可写字段预填（空值），避免骨架引导漏写
+        "current": {"time": "", "location": "", "power_level": "", "abilities": "",
+                    "injury": "", "equipment": "", "assets": "", "situation": "",
+                    "present_characters": []},
         "entities": [], "lines": [],
-        "ledger": {"transactions": []}, "timeline": {"events": []},
+        "ledger": {"transactions": []}, "timeline": {"events": [], "arcs": []},
         "synopsis": {"title": "", "text": ""},
-
     }
     if getattr(args, "write", False):
         common.dump_json(inbox / f"{ch}.json", skeleton)
         print(f"🧩 骨架已写入: {inbox / f'{ch}.json'}")
+        sys.stdout.flush()
         print(f"   填六区后 `python studio.py sync {ch} --dry-run` 预演；"
               f"纪律与键形状见 {inbox / 'README.md'}", file=sys.stderr)
         return 0
     print(json.dumps(skeleton, ensure_ascii=False, indent=1))
+    sys.stdout.flush()
     print(f"🧩 骨架已打印（不落盘）：填六区后存为 state/inbox/{ch}.json；"
-    
           f"纪律与键形状见 {inbox / 'README.md'}；只写增量、事实须能在 {ch} final 找到出处",
           file=sys.stderr)
     return 0
