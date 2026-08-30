@@ -618,6 +618,24 @@ def apply_proposal(book: Path, proposal: dict, expected_chapter: str | None = No
             rep["dry_run"] = True
         return rep
 
+    # 同步前置闸门（AGENTS 禁令3 / novel_workflow Stage 4）：
+    # 在内存副本上先跑"状态体检"（账本重算/唯一性/实体闭合），全部通过才允许落盘。
+    # 任何体检失败 → 整体拒绝，一个字节都不写、不归档、不封存快照——避免"脏状态已写入、
+    # 提案却进了 processed/、无法走 failed/ 捡回"的不可恢复污染。
+    verify_errors = verify_data(data)
+    if verify_errors:
+        rep["errors"].extend(verify_errors)
+        rep["updated"] = []
+        rep["warnings"] = []
+        if dry_run:
+            rep["dry_run"] = True
+        return rep
+
+    # 空提案识别：合并后若无任何"实际变更"（六区全空/全为重复跳过），标记 no-op，
+    # 由 apply_inbox 计为 skipped（不计 applied、不封存快照）——防止"无细纲/无草稿/零更新"
+    # 的章被当成功合并推进流水线。
+    rep["changed"] = bool(rep["updated"])
+
     if dry_run:
         rep["dry_run"] = True
         return rep
@@ -713,7 +731,14 @@ def apply_inbox(book: Path, expect_chapter: str | None = None, dry_run: bool = F
                 if not dry_run:
                     rep["archived_to"] = str(_archive(pf, inbox / "failed"))
                 break
-            overall["duplicates" if rep.get("duplicate") else "applied"] += 1
+            if rep.get("duplicate"):
+                overall["duplicates"] += 1
+            elif rep.get("changed"):
+                overall["applied"] += 1
+            else:  # no-op：合并后无任何实际变更 → 计为 skipped，不推进流水线、不封存快照
+                overall["skipped"] += 1
+                rep["noop"] = True
+                rep["warnings"].append("提案合并后无任何实际变更（no-op），不计入已应用、不封存")
             if not dry_run:
                 rep["archived_to"] = str(_archive(pf, inbox / "processed"))
     return overall
@@ -722,16 +747,10 @@ def apply_inbox(book: Path, expect_chapter: str | None = None, dry_run: bool = F
 # ---------------------------------------------------------------------------
 # 合并后体检（sync 第二步；M2 的 check 命令复用）
 # ---------------------------------------------------------------------------
-def verify_state(book: Path) -> list[str]:
+def verify_data(data: dict[str, dict]) -> list[str]:
+    """在内存/磁盘的六表副本上跑机械体检：账本重算、唯一性、实体闭合。
+    与 verify_state 同口径，但接受任意 data 副本（apply_proposal 在落盘前用它预检）。"""
     errors: list[str] = []
-    data: dict[str, dict] = {}
-    for key in STATE_KEYS:
-        try:
-            data[key] = load_state(book, key)
-        except (ValueError, FileNotFoundError) as exc:
-            errors.append(str(exc))
-    if errors:
-        return errors
 
     led = data["ledger"]
     running = {k: v.get("initial", 0) for k, v in led.get("pools", {}).items()}
@@ -770,3 +789,14 @@ def verify_state(book: Path) -> list[str]:
             errors.append(f"current.present_characters 引用未登记实体「{name}」"
                           "（先在 entities 提案注册，名字须与卡一致）")
     return errors
+
+
+def verify_state(book: Path) -> list[str]:
+    """从磁盘加载六表并跑机械体检（M2 的 check 命令与 sync 复用）。"""
+    data: dict[str, dict] = {}
+    for key in STATE_KEYS:
+        try:
+            data[key] = load_state(book, key)
+        except (ValueError, FileNotFoundError) as exc:
+            return [str(exc)]
+    return verify_data(data)
